@@ -197,4 +197,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as exc:  # pragma: no cover - runtime guard
+        import traceback
+
+        traceback.print_exc(file=sys.stderr)
+        sys.stderr.write(f"\nError: {exc}\n")
+        sys.exit(1)
