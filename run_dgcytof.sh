@@ -9,5 +9,5 @@ python_bin="${script_dir}/.venv/bin/python"
 "${python_bin}" "${script_dir}/dgcytof_cli.py" \
   --name "dgcytof" \
   --output_dir "${script_dir}/out/data/analysis/default/dgcytof" \
-  --data.matrix "${script_dir}/out/data/data_preprocessing/default/data_preprocessing.csv" \
-  --data.true_labels "${script_dir}/out/data/data_preprocessing/default/data_preprocessing_labels.txt"
+  --data.matrix "${script_dir}/out/data/data_preprocessing/default/data_preprocessing.csv.gz" \
+  --data.true_labels "${script_dir}/out/data/data_preprocessing/default/data_preprocessing_labels.txt.gz"

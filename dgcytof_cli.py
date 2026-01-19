@@ -58,8 +58,9 @@ def _has_header(first_line):
 
 def load_labels(data_file):
     """
-    Load labels as 1D array; keeps missing labels as NaN (needed for
-    semi-supervised handling in preprocessing).
+    Load labels as 1D numeric array. If the labels are textual (e.g. gate names),
+    map unique non-empty, non-'unlabeled' strings to integer class ids starting at 1.
+    Keep missing/unlabeled as NaN to allow semi-supervised handling downstream.
     """
     opener = gzip.open if data_file.endswith(".gz") else open
     with opener(data_file, "rt") as handle:
@@ -71,12 +72,30 @@ def load_labels(data_file):
             skip_blank_lines=False,
         ).iloc[:, 0]
 
-    try:
-        labels = pd.to_numeric(series, errors="coerce").to_numpy()
-    except Exception as exc:
-        raise ValueError("Invalid data structure, cannot parse labels.") from exc
+    # First try numeric conversion
+    numeric = pd.to_numeric(series, errors="coerce")
+    if numeric.notna().any():
+        labels = numeric.to_numpy()
+    else:
+        # Map textual labels to integers. Treat empty strings and 'unlabeled' as missing.
+        str_series = series.astype(str).str.strip()
+        mask_valid = ~(
+            str_series.isna()
+            | str_series.eq("")
+            | str_series.str.lower().eq("unlabeled")
+        )
+        unique_labels = sorted(str_series[mask_valid].unique())
+        if not unique_labels:
+            # No usable labels found
+            labels = numeric.to_numpy()
+        else:
+            mapping = {lab: i + 1 for i, lab in enumerate(unique_labels)}
+            mapped = str_series.map(mapping).astype(float)
+            # Unmapped entries become NaN
+            mapped[~mask_valid] = float("nan")
+            labels = mapped.to_numpy()
 
-    if labels.ndim != 1:
+    if getattr(labels, "ndim", None) != 1:
         raise ValueError("Invalid data structure, not a 1D matrix?")
     return labels
 
@@ -92,8 +111,13 @@ def load_dataset(data_file):
     )
     try:
         df = df.apply(pd.to_numeric)
-    except ValueError as exc:
-        raise ValueError("Data matrix contains non-numeric values.") from exc
+    except Exception:
+        # Fallback: coerce non-numeric entries to NaN and drop rows that are entirely non-numeric
+        df_coerced = df.apply(pd.to_numeric, errors="coerce")
+        df_coerced = df_coerced.dropna(how="all")
+        if df_coerced.empty:
+            raise ValueError("Data matrix contains non-numeric values.")
+        df = df_coerced
 
     if not has_header:
         df.columns = [f"f{i}" for i in range(df.shape[1])]
