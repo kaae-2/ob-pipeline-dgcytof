@@ -4,19 +4,22 @@ Omnibenchmark runner that mirrors run_agglomerative.py but drives the DGCyTOF
 pipeline instead (https://github.com/lijcheng12/DGCyTOF/).
 
 Input/output contract:
-* Accepts the same CLI args as run_agglomerative.py (`--data.matrix`,
-  `--data.true_labels`, `--output_dir`, `--name`).
-* Emits a plain-text file with one predicted label per line (matching the
-  formatting of `true_labels`).
+* Accepts training and test inputs (`--data.train_matrix`,
+  `--data.train_labels`, `--data.test_matrix`, `--output_dir`, `--name`).
+* Emits a tar.gz of per-sample prediction CSVs for the test set.
 """
 
 import argparse
 import gzip
+import io
 import os
 import sys
+import tarfile
+import tempfile
 
 import numpy as np
 import pandas as pd
+from typing import List
 from sklearn.model_selection import train_test_split
 
 try:
@@ -72,9 +75,9 @@ def load_labels(data_file):
             skip_blank_lines=False,
         ).iloc[:, 0]
 
-    # First try numeric conversion
-    numeric = pd.to_numeric(series, errors="coerce")
+    numeric = pd.Series(pd.to_numeric(series, errors="coerce"))
     if numeric.notna().any():
+        numeric = numeric.mask(numeric == 0)
         labels = numeric.to_numpy()
     else:
         # Map textual labels to integers. Treat empty strings and 'unlabeled' as missing.
@@ -100,6 +103,19 @@ def load_labels(data_file):
     return labels
 
 
+def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
+    try:
+        df_numeric = df.apply(pd.to_numeric, axis=0)
+    except Exception:
+        df_numeric = df.apply(pd.to_numeric, axis=0, errors="coerce")
+        df_numeric = df_numeric.dropna(how="all")
+        if df_numeric.empty:
+            raise ValueError("Data matrix contains non-numeric values.")
+    if isinstance(df_numeric, pd.Series):
+        return df_numeric.to_frame()
+    return df_numeric
+
+
 def load_dataset(data_file):
     first_line = _read_first_line(data_file)
     has_header = _has_header(first_line)
@@ -109,21 +125,39 @@ def load_dataset(data_file):
         header=0 if has_header else None,
         compression="infer",
     )
-    try:
-        df = df.apply(pd.to_numeric)
-    except Exception:
-        # Fallback: coerce non-numeric entries to NaN and drop rows that are entirely non-numeric
-        df_coerced = df.apply(pd.to_numeric, errors="coerce")
-        df_coerced = df_coerced.dropna(how="all")
-        if df_coerced.empty:
-            raise ValueError("Data matrix contains non-numeric values.")
-        df = df_coerced
+    df = _coerce_numeric(df)
 
     if not has_header:
         df.columns = [f"f{i}" for i in range(df.shape[1])]
     else:
         df.columns = [str(col) for col in df.columns]
     return df
+
+
+def load_test_samples(data_file: str) -> List[tuple[str, pd.DataFrame]]:
+    if not tarfile.is_tarfile(data_file):
+        return [(os.path.basename(data_file), load_dataset(data_file))]
+
+    samples: List[tuple[str, pd.DataFrame]] = []
+    with tarfile.open(data_file, "r:gz") as tar:
+        members = [m for m in tar.getmembers() if m.isfile()]
+        for member in members:
+            file_obj = tar.extractfile(member)
+            if file_obj is None:
+                continue
+            data = file_obj.read()
+            if member.name.endswith(".gz"):
+                decompressed = gzip.decompress(data)
+                df = pd.read_csv(io.BytesIO(decompressed), header=None)
+            else:
+                df = pd.read_csv(io.BytesIO(data), header=None)
+            df = _coerce_numeric(df)
+            df.columns = [f"f{i}" for i in range(df.shape[1])]
+            samples.append((member.name, df))
+
+    if not samples:
+        return [("empty", pd.DataFrame())]
+    return samples
 
 
 class SimpleClassifier(nn.Module):
@@ -142,25 +176,23 @@ class SimpleClassifier(nn.Module):
         return self.model(x)
 
 
-def run_dgcytof(data, labels, random_state=42):
+def train_dgcytof(train_data, train_labels, random_state=42):
     """
     Train a small feed-forward network with the DGCyTOF helpers and return
     predicted labels for the full dataset (1-based to match clustbench).
     """
-    if len(data) != len(labels):
+    if len(train_data) != len(train_labels):
         raise ValueError(
-            f"Number of labels ({len(labels)}) does not match number of rows in the data matrix ({len(data)})."
+            f"Number of labels ({len(train_labels)}) does not match number of rows in the data matrix ({len(train_data)})."
         )
 
-    labels_series = pd.to_numeric(pd.Series(labels), errors="coerce")
-    labels_zero_based = labels_series - 1
-    df = data.copy()
+    labels_series = pd.to_numeric(pd.Series(train_labels), errors="coerce")
+    labels_zero_based = labels_series.astype(float) - 1
+    df = train_data.copy()
     df["label"] = labels_zero_based
 
     # Use only labeled rows for training, but keep the full matrix for inference.
     X_data_labeled, y_data, _ = DGCyTOF.preprocessing(df, [])
-    X_full = df.drop(columns=["label"])
-
     if y_data.empty:
         raise ValueError("No labeled rows available after preprocessing.")
     y_data = y_data.astype(int)
@@ -221,9 +253,14 @@ def run_dgcytof(data, labels, random_state=42):
     DGCyTOF.validate_model(model_fc, val_dataset, classes, params_val=val_params)
 
     model_fc.eval()
+    return model_fc
+
+
+def predict_dgcytof(model, data: pd.DataFrame) -> np.ndarray:
+    model.eval()
     with torch.no_grad():
-        full_tensor = torch.tensor(X_full.values, dtype=torch.float32)
-        outputs = model_fc(full_tensor)
+        full_tensor = torch.tensor(data.values, dtype=torch.float32)
+        outputs = model(full_tensor)
         predicted = torch.argmax(outputs, dim=1).cpu().numpy()
 
     return predicted + 1  # back to 1-based labels
@@ -232,15 +269,21 @@ def run_dgcytof(data, labels, random_state=42):
 def main():
     parser = argparse.ArgumentParser(description="clustbench DGCyTOF runner")
     parser.add_argument(
-        "--data.matrix",
+        "--data.train_matrix",
         type=str,
-        help="gz-compressed textfile containing the comma-separated data to be clustered.",
+        help="gz-compressed CSV containing training data.",
         required=True,
     )
     parser.add_argument(
-        "--data.true_labels",
+        "--data.train_labels",
         type=str,
-        help="gz-compressed textfile with the true labels; used to select a range of ks.",
+        help="gz-compressed CSV containing training labels.",
+        required=True,
+    )
+    parser.add_argument(
+        "--data.test_matrix",
+        type=str,
+        help="gz-compressed CSV containing test data.",
         required=True,
     )
     parser.add_argument(
@@ -261,28 +304,32 @@ def main():
         parser.print_help()
         sys.exit(0)
 
-    truth = load_labels(getattr(args, "data.true_labels"))
-    data_matrix = getattr(args, "data.matrix")
-    data_df = load_dataset(data_matrix)
-    predictions = run_dgcytof(data_df, truth)
-
-    if len(predictions) != len(truth):
-        sys.stderr.write(
-            f"[dgcytof_cli] Length mismatch: predictions={len(predictions)}, "
-            f"truth={len(truth)}, data_rows={len(data_df)}, "
-            f"nan_labels={int(pd.isna(truth).sum())}\n"
-        )
-        raise ValueError("Predictions and true labels have mismatched lengths.")
-
     name = args.name
     output_dir = args.output_dir or "."
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, f"{name}_predicted_labels.txt")
-    output_labels = [
-        "" if pd.isna(t) else f"{float(p):.1f}"
-        for p, t in zip(predictions, truth)
-    ]
-    np.savetxt(output_path, np.array(output_labels, dtype=str), fmt="%s")
+
+    train_data = load_dataset(getattr(args, "data.train_matrix"))
+    train_labels = load_labels(getattr(args, "data.train_labels"))
+    test_samples = load_test_samples(getattr(args, "data.test_matrix"))
+    model = train_dgcytof(train_data, train_labels)
+
+    output_path = os.path.join(output_dir, f"{name}_predicted_labels.tar.gz")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        output_files: List[str] = []
+        for sample_name, sample_df in test_samples:
+            predictions = predict_dgcytof(model, sample_df)
+            output_labels = ["" if pd.isna(p) else f"{float(p):.1f}" for p in predictions]
+            safe_name = os.path.basename(sample_name)
+            if not safe_name.endswith(".csv.gz"):
+                safe_name = f"{safe_name}.predictions.csv.gz"
+            file_path = os.path.join(tmpdir, safe_name)
+            with gzip.open(file_path, "wt") as handle:
+                pd.Series(output_labels).to_csv(handle, index=False, header=False)
+            output_files.append(file_path)
+
+        with tarfile.open(output_path, "w:gz") as tar:
+            for path in output_files:
+                tar.add(path, arcname=os.path.basename(path))
 
 
 if __name__ == "__main__":
