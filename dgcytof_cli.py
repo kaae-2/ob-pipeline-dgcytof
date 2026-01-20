@@ -314,6 +314,8 @@ def main():
     model = train_dgcytof(train_data, train_labels)
 
     output_path = os.path.join(output_dir, f"{name}_predicted_labels.tar.gz")
+    if os.path.islink(output_path):
+        os.unlink(output_path)
     with tempfile.TemporaryDirectory() as tmpdir:
         output_files: List[str] = []
         for sample_name, sample_df in test_samples:
