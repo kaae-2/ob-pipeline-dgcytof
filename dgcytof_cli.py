@@ -261,6 +261,8 @@ def train_dgcytof(train_data, train_labels, random_state=42):
         raise ValueError("No labeled rows available after preprocessing.")
     y_data = y_data.astype(int)
     classes = sorted(y_data.unique())
+    label_map = {label: idx for idx, label in enumerate(classes)}
+    y_data = y_data.map(label_map).astype(int)
     num_classes = len(classes)
     if num_classes < 2:
         raise ValueError("DGCyTOF requires at least two classes to train.")
@@ -321,17 +323,17 @@ def train_dgcytof(train_data, train_labels, random_state=42):
     DGCyTOF.validate_model(model_fc, val_dataset, classes, params_val=val_params)
 
     model_fc.eval()
-    return model_fc
+    return model_fc, classes
 
 
-def predict_dgcytof(model, data: pd.DataFrame) -> np.ndarray:
+def predict_dgcytof(model, data: pd.DataFrame, classes: List[int]) -> np.ndarray:
     model.eval()
     with torch.no_grad():
         full_tensor = torch.tensor(data.values, dtype=torch.float32)
         outputs = model(full_tensor)
         predicted = torch.argmax(outputs, dim=1).cpu().numpy()
 
-    return predicted + 1  # back to 1-based labels
+    return np.asarray([classes[idx] for idx in predicted], dtype=int)
 
 
 def main():
@@ -381,7 +383,7 @@ def main():
     )
     train_labels = _load_labels_from_tar(getattr(args, "data.train_labels"))
     test_samples = load_test_samples(getattr(args, "data.test_matrix"))
-    model = train_dgcytof(train_data, train_labels)
+    model, classes = train_dgcytof(train_data, train_labels)
 
     output_path = os.path.join(output_dir, f"{name}_predicted_labels.tar.gz")
     if os.path.islink(output_path):
@@ -389,7 +391,7 @@ def main():
     with tempfile.TemporaryDirectory() as tmpdir:
         output_files: List[str] = []
         for sample_name, sample_df, sample_number in test_samples:
-            predictions = predict_dgcytof(model, sample_df)
+            predictions = predict_dgcytof(model, sample_df, classes)
             output_labels = ["" if pd.isna(p) else f"{int(p)}" for p in predictions]
             if sample_number is None:
                 sample_number = str(len(output_files) + 1)
