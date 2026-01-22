@@ -9,6 +9,6 @@ python_bin="${script_dir}/.venv/bin/python"
 "${python_bin}" "${script_dir}/dgcytof_cli.py" \
   --name "dgcytof" \
   --output_dir "${script_dir}/out/data/analysis/default/dgcytof" \
-  --data.train_matrix "${script_dir}/out/data/data_preprocessing/default/data_preprocessing.train.matrix.csv.gz" \
-  --data.train_labels "${script_dir}/out/data/data_preprocessing/default/data_preprocessing.train.labels.csv.gz" \
-  --data.test_matrix "${script_dir}/out/data/data_preprocessing/default/data_preprocessing.test.matrices.tar.gz"
+  --data.train_matrix "${script_dir}/out/data/data_preprocessing/default/data_import.train.matrix.tar.gz" \
+  --data.train_labels "${script_dir}/out/data/data_preprocessing/default/data_import.train.labels.tar.gz" \
+  --data.test_matrix "${script_dir}/out/data/data_preprocessing/default/data_import.test.matrices.tar.gz"

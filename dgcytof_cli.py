@@ -13,13 +13,14 @@ import argparse
 import gzip
 import io
 import os
+import re
 import sys
 import tarfile
 import tempfile
 
 import numpy as np
 import pandas as pd
-from typing import List
+from typing import List, Optional, Tuple
 from sklearn.model_selection import train_test_split
 
 try:
@@ -59,22 +60,7 @@ def _has_header(first_line):
     return False
 
 
-def load_labels(data_file):
-    """
-    Load labels as 1D numeric array. If the labels are textual (e.g. gate names),
-    map unique non-empty, non-'unlabeled' strings to integer class ids starting at 1.
-    Keep missing/unlabeled as NaN to allow semi-supervised handling downstream.
-    """
-    opener = gzip.open if data_file.endswith(".gz") else open
-    with opener(data_file, "rt") as handle:
-        series = pd.read_csv(
-            handle,
-            header=None,
-            comment="#",
-            na_values=["", '""', "nan", "NaN"],
-            skip_blank_lines=False,
-        ).iloc[:, 0]
-
+def _normalize_labels(series: pd.Series) -> np.ndarray:
     numeric = pd.Series(pd.to_numeric(series, errors="coerce"))
     if numeric.notna().any():
         numeric = numeric.mask(numeric == 0)
@@ -101,6 +87,24 @@ def load_labels(data_file):
     if getattr(labels, "ndim", None) != 1:
         raise ValueError("Invalid data structure, not a 1D matrix?")
     return labels
+
+
+def load_labels(data_file):
+    """
+    Load labels as 1D numeric array. If the labels are textual (e.g. gate names),
+    map unique non-empty, non-'unlabeled' strings to integer class ids starting at 1.
+    Keep missing/unlabeled as NaN to allow semi-supervised handling downstream.
+    """
+    opener = gzip.open if data_file.endswith(".gz") else open
+    with opener(data_file, "rt") as handle:
+        series = pd.read_csv(
+            handle,
+            header=None,
+            comment="#",
+            na_values=["", '""', "nan", "NaN"],
+            skip_blank_lines=False,
+        ).iloc[:, 0]
+    return _normalize_labels(series)
 
 
 def _coerce_numeric(df: pd.DataFrame) -> pd.DataFrame:
@@ -134,11 +138,71 @@ def load_dataset(data_file):
     return df
 
 
-def load_test_samples(data_file: str) -> List[tuple[str, pd.DataFrame]]:
+def _load_single_csv_from_tar(data_file: str) -> Tuple[str, pd.DataFrame]:
     if not tarfile.is_tarfile(data_file):
-        return [(os.path.basename(data_file), load_dataset(data_file))]
+        return os.path.basename(data_file), load_dataset(data_file)
 
-    samples: List[tuple[str, pd.DataFrame]] = []
+    with tarfile.open(data_file, "r:gz") as tar:
+        members = [m for m in tar.getmembers() if m.isfile()]
+        if not members:
+            raise ValueError(f"No files found in archive: {data_file}")
+        member = sorted(members, key=lambda m: m.name)[0]
+        file_obj = tar.extractfile(member)
+        if file_obj is None:
+            raise ValueError(f"Unable to read {member.name} from {data_file}")
+        data = file_obj.read()
+        if member.name.endswith(".gz"):
+            data = gzip.decompress(data)
+        df = pd.read_csv(io.BytesIO(data), header=None)
+        df = _coerce_numeric(df)
+        df.columns = [f"f{i}" for i in range(df.shape[1])]
+        return member.name, df
+
+
+def _load_labels_from_tar(data_file: str) -> np.ndarray:
+    if not tarfile.is_tarfile(data_file):
+        return load_labels(data_file)
+
+    with tarfile.open(data_file, "r:gz") as tar:
+        members = [m for m in tar.getmembers() if m.isfile()]
+        if not members:
+            raise ValueError(f"No files found in archive: {data_file}")
+        member = sorted(members, key=lambda m: m.name)[0]
+        file_obj = tar.extractfile(member)
+        if file_obj is None:
+            raise ValueError(f"Unable to read {member.name} from {data_file}")
+        data = file_obj.read()
+        if member.name.endswith(".gz"):
+            data = gzip.decompress(data)
+        series = pd.read_csv(
+            io.BytesIO(data),
+            header=None,
+            comment="#",
+            na_values=["", '""', "nan", "NaN"],
+            skip_blank_lines=False,
+        ).iloc[:, 0]
+        return _normalize_labels(series)
+
+
+def _extract_sample_number(sample_name: str) -> Optional[str]:
+    base = os.path.basename(sample_name)
+    while True:
+        root, ext = os.path.splitext(base)
+        if not ext:
+            break
+        base = root
+    match = re.search(r"(\d+)(?!.*\d)", base)
+    if match:
+        return match.group(1)
+    return None
+
+
+def load_test_samples(data_file: str) -> List[Tuple[str, pd.DataFrame, Optional[str]]]:
+    if not tarfile.is_tarfile(data_file):
+        sample_name = os.path.basename(data_file)
+        return [(sample_name, load_dataset(data_file), _extract_sample_number(sample_name))]
+
+    samples: List[Tuple[str, pd.DataFrame, Optional[str]]] = []
     with tarfile.open(data_file, "r:gz") as tar:
         members = [m for m in tar.getmembers() if m.isfile()]
         for member in members:
@@ -147,16 +211,14 @@ def load_test_samples(data_file: str) -> List[tuple[str, pd.DataFrame]]:
                 continue
             data = file_obj.read()
             if member.name.endswith(".gz"):
-                decompressed = gzip.decompress(data)
-                df = pd.read_csv(io.BytesIO(decompressed), header=None)
-            else:
-                df = pd.read_csv(io.BytesIO(data), header=None)
+                data = gzip.decompress(data)
+            df = pd.read_csv(io.BytesIO(data), header=None)
             df = _coerce_numeric(df)
             df.columns = [f"f{i}" for i in range(df.shape[1])]
-            samples.append((member.name, df))
+            samples.append((member.name, df, _extract_sample_number(member.name)))
 
     if not samples:
-        return [("empty", pd.DataFrame())]
+        return [("empty", pd.DataFrame(), None)]
     return samples
 
 
@@ -186,8 +248,10 @@ def train_dgcytof(train_data, train_labels, random_state=42):
             f"Number of labels ({len(train_labels)}) does not match number of rows in the data matrix ({len(train_data)})."
         )
 
-    labels_series = pd.to_numeric(pd.Series(train_labels), errors="coerce")
-    labels_zero_based = labels_series.astype(float) - 1
+    labels_series = pd.Series(train_labels)
+    labels_numeric = pd.Series(pd.to_numeric(labels_series, errors="coerce"))
+    labels_array = labels_numeric.to_numpy()
+    labels_zero_based = labels_array.astype(float) - 1
     df = train_data.copy()
     df["label"] = labels_zero_based
 
@@ -222,13 +286,17 @@ def train_dgcytof(train_data, train_labels, random_state=42):
             random_state=random_state,
         )
 
+    X_train_arr = np.asarray(X_train)
+    y_train_arr = np.asarray(y_train, dtype=np.int64)
+    X_val_arr = np.asarray(X_val)
+    y_val_arr = np.asarray(y_val, dtype=np.int64)
     train_dataset = TensorDataset(
-        torch.tensor(X_train.values, dtype=torch.float32),
-        torch.tensor(y_train.values.astype(np.int64)),
+        torch.tensor(X_train_arr, dtype=torch.float32),
+        torch.tensor(y_train_arr),
     )
     val_dataset = TensorDataset(
-        torch.tensor(X_val.values, dtype=torch.float32),
-        torch.tensor(y_val.values.astype(np.int64)),
+        torch.tensor(X_val_arr, dtype=torch.float32),
+        torch.tensor(y_val_arr),
     )
 
     model_fc = SimpleClassifier(
@@ -308,8 +376,10 @@ def main():
     output_dir = args.output_dir or "."
     os.makedirs(output_dir, exist_ok=True)
 
-    train_data = load_dataset(getattr(args, "data.train_matrix"))
-    train_labels = load_labels(getattr(args, "data.train_labels"))
+    _train_data_name, train_data = _load_single_csv_from_tar(
+        getattr(args, "data.train_matrix")
+    )
+    train_labels = _load_labels_from_tar(getattr(args, "data.train_labels"))
     test_samples = load_test_samples(getattr(args, "data.test_matrix"))
     model = train_dgcytof(train_data, train_labels)
 
@@ -318,14 +388,14 @@ def main():
         os.unlink(output_path)
     with tempfile.TemporaryDirectory() as tmpdir:
         output_files: List[str] = []
-        for sample_name, sample_df in test_samples:
+        for sample_name, sample_df, sample_number in test_samples:
             predictions = predict_dgcytof(model, sample_df)
-            output_labels = ["" if pd.isna(p) else f"{float(p):.1f}" for p in predictions]
-            safe_name = os.path.basename(sample_name)
-            if not safe_name.endswith(".csv.gz"):
-                safe_name = f"{safe_name}.predictions.csv.gz"
+            output_labels = ["" if pd.isna(p) else f"{int(p)}" for p in predictions]
+            if sample_number is None:
+                sample_number = str(len(output_files) + 1)
+            safe_name = f"{name}-prediction-{sample_number}.csv"
             file_path = os.path.join(tmpdir, safe_name)
-            with gzip.open(file_path, "wt") as handle:
+            with open(file_path, "wt") as handle:
                 pd.Series(output_labels).to_csv(handle, index=False, header=False)
             output_files.append(file_path)
 
