@@ -17,6 +17,7 @@ import re
 import sys
 import tarfile
 import tempfile
+import contextlib
 
 import numpy as np
 import pandas as pd
@@ -316,11 +317,11 @@ def train_dgcytof(train_data, train_labels, random_state=42):
         "num_workers": 0,
     }
 
-    DGCyTOF.train_model(
-        model_fc, train_dataset, max_epochs=20, params_train=train_params
-    )
-    # Prints accuracy; side effect is fine for benchmarking visibility.
-    DGCyTOF.validate_model(model_fc, val_dataset, classes, params_val=val_params)
+    with contextlib.redirect_stdout(io.StringIO()):
+        DGCyTOF.train_model(
+            model_fc, train_dataset, max_epochs=20, params_train=train_params
+        )
+        DGCyTOF.validate_model(model_fc, val_dataset, classes, params_val=val_params)
 
     model_fc.eval()
     return model_fc, classes
