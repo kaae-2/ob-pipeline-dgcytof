@@ -57,11 +57,11 @@ def validate_model(
     print("Accuracy:", round(100 * val_correct.item() / val_total, 4))
     print("-" * 100)
     for i in range(labels):
-        print(
-            "Accuracy of {} : {}".format(
-                classes[i], round(100 * class_correct[i] / class_total[i], 3)
-            )
-        )
+        if class_total[i] == 0:
+            accuracy = "n/a"
+        else:
+            accuracy = round(100 * class_correct[i] / class_total[i], 3)
+        print("Accuracy of {} : {}".format(classes[i], accuracy))
 
     return list(zip(val_predicted, val_labels, val_outputs))
 
