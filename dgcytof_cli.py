@@ -379,11 +379,14 @@ def main():
     output_dir = args.output_dir or "."
     os.makedirs(output_dir, exist_ok=True)
 
+    print("DGCyTOF: loading training data", flush=True)
     _train_data_name, train_data = _load_single_csv_from_tar(
         getattr(args, "data.train_matrix")
     )
     train_labels = _load_labels_from_tar(getattr(args, "data.train_labels"))
+    print("DGCyTOF: loading test data", flush=True)
     test_samples = load_test_samples(getattr(args, "data.test_matrix"))
+    print("DGCyTOF: training model", flush=True)
     model, classes = train_dgcytof(train_data, train_labels)
 
     output_path = os.path.join(output_dir, f"{name}_predicted_labels.tar.gz")
@@ -391,6 +394,7 @@ def main():
         os.unlink(output_path)
     with tempfile.TemporaryDirectory() as tmpdir:
         output_files: List[str] = []
+        print("DGCyTOF: generating predictions", flush=True)
         for sample_name, sample_df, sample_number in test_samples:
             predictions = predict_dgcytof(model, sample_df, classes)
             output_labels = ["" if pd.isna(p) else f"{int(p)}" for p in predictions]
@@ -405,6 +409,7 @@ def main():
         with tarfile.open(output_path, "w:gz") as tar:
             for path in output_files:
                 tar.add(path, arcname=os.path.basename(path))
+    print("DGCyTOF: finished", flush=True)
 
 
 if __name__ == "__main__":
