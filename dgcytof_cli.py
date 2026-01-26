@@ -252,7 +252,7 @@ def train_dgcytof(train_data, train_labels, random_state=42):
     labels_series = pd.Series(train_labels)
     labels_numeric = pd.Series(pd.to_numeric(labels_series, errors="coerce"))
     labels_array = labels_numeric.to_numpy()
-    labels_zero_based = labels_array.astype(float) - 1
+    labels_zero_based = labels_array.astype(float)
     df = train_data.copy()
     df["label"] = labels_zero_based
 
