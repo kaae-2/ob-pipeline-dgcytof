@@ -7,9 +7,11 @@ Input/output contract:
 * Accepts training and test inputs (`--data.train_matrix`,
   `--data.train_labels`, `--data.test_matrix`, `--output_dir`, `--name`).
 * Emits a tar.gz of per-sample prediction CSVs for the test set.
+
 """
 
 import argparse
+import contextlib
 import gzip
 import io
 import os
@@ -17,11 +19,10 @@ import re
 import sys
 import tarfile
 import tempfile
-import contextlib
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from typing import List, Optional, Tuple
 from sklearn.model_selection import train_test_split
 
 try:
@@ -201,7 +202,9 @@ def _extract_sample_number(sample_name: str) -> Optional[str]:
 def load_test_samples(data_file: str) -> List[Tuple[str, pd.DataFrame, Optional[str]]]:
     if not tarfile.is_tarfile(data_file):
         sample_name = os.path.basename(data_file)
-        return [(sample_name, load_dataset(data_file), _extract_sample_number(sample_name))]
+        return [
+            (sample_name, load_dataset(data_file), _extract_sample_number(sample_name))
+        ]
 
     samples: List[Tuple[str, pd.DataFrame, Optional[str]]] = []
     with tarfile.open(data_file, "r:gz") as tar:
