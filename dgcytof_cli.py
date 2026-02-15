@@ -361,6 +361,12 @@ def main():
         required=True,
     )
     parser.add_argument(
+        "--data.label_key",
+        type=str,
+        help="label key metadata path (accepted but unused).",
+        required=False,
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
         help="output directory to store data files.",
