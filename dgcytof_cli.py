@@ -226,12 +226,6 @@ def load_test_samples(data_file: str) -> List[Tuple[str, pd.DataFrame, Optional[
     return samples
 
 
-def _arcsinh_transform(df: pd.DataFrame, cofactor: float = 5.0) -> pd.DataFrame:
-    values = df.to_numpy(dtype=np.float32, copy=False)
-    transformed = np.arcsinh(values / cofactor)
-    return pd.DataFrame(transformed, columns=df.columns)
-
-
 class SimpleClassifier(nn.Module):
     def __init__(self, input_dim, num_classes):
         super().__init__()
@@ -401,13 +395,6 @@ def main():
     train_labels = _load_labels_from_tar(getattr(args, "data.train_labels"))
     print("DGCyTOF: loading test data", flush=True)
     test_samples = load_test_samples(getattr(args, "data.test_matrix"))
-
-    print("DGCyTOF: applying arcsinh transform (cofactor=5)", flush=True)
-    train_data = _arcsinh_transform(train_data, cofactor=5.0)
-    test_samples = [
-        (sample_name, _arcsinh_transform(sample_df, cofactor=5.0), sample_number)
-        for sample_name, sample_df, sample_number in test_samples
-    ]
 
     print("DGCyTOF: training model", flush=True)
     model, classes = train_dgcytof(train_data, train_labels)
