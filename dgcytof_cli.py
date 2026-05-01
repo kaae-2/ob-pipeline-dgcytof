@@ -195,11 +195,10 @@ def _load_labels_from_tar(data_file: str) -> np.ndarray:
 
 def _extract_sample_number(sample_name: str) -> Optional[str]:
     base = os.path.basename(sample_name)
-    while True:
-        root, ext = os.path.splitext(base)
-        if not ext:
+    for suffix in ('.csv.gz', '.labels.gz', '.label.gz', '.csv', '.gz'):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
             break
-        base = root
     match = re.search(r"(\d+)(?!.*\d)", base)
     if match:
         return match.group(1)
