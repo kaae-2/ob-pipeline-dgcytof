@@ -19,27 +19,34 @@ import re
 import sys
 import tarfile
 import tempfile
-from typing import List, Optional, Tuple
+from typing import Any, List, Optional, Tuple, cast
 
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
 
 try:
     import torch
     import torch.nn as nn
     from torch.utils.data import TensorDataset
-except ImportError as exc:  # pragma: no cover - runtime guard
-    raise ImportError(
-        "PyTorch is required to run DGCyTOF. Install with `pip install torch`."
-    ) from exc
+    TORCH_AVAILABLE = True
+    TORCH_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - runtime guard
+    torch = None  # type: ignore[assignment]
+    nn = None  # type: ignore[assignment]
+    TensorDataset = None  # type: ignore[assignment]
+    TORCH_AVAILABLE = False
+    TORCH_IMPORT_ERROR = exc
 
 try:
     import dgcytof_local as DGCyTOF
-except ImportError as exc:  # pragma: no cover - runtime guard
-    raise ImportError(
-        "Missing dgcytof_local module. Ensure dgcytof_local.py is present."
-    ) from exc
+    DGCYTOF_AVAILABLE = True
+    DGCYTOF_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - runtime guard
+    DGCyTOF = None  # type: ignore[assignment]
+    DGCYTOF_AVAILABLE = False
+    DGCYTOF_IMPORT_ERROR = exc
 
 
 def _read_first_line(path):
@@ -226,22 +233,6 @@ def load_test_samples(data_file: str) -> List[Tuple[str, pd.DataFrame, Optional[
     return samples
 
 
-class SimpleClassifier(nn.Module):
-    def __init__(self, input_dim, num_classes):
-        super().__init__()
-        self.model = nn.Sequential(
-            nn.Linear(input_dim, 128),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(128, 64),
-            nn.ReLU(),
-            nn.Linear(64, num_classes),
-        )
-
-    def forward(self, x):  # pragma: no cover - passthrough
-        return self.model(x)
-
-
 def train_dgcytof(train_data, train_labels, random_state=42):
     """
     Train a small feed-forward network with the DGCyTOF helpers and return
@@ -254,10 +245,50 @@ def train_dgcytof(train_data, train_labels, random_state=42):
 
     labels_series = pd.Series(train_labels)
     labels_numeric = pd.Series(pd.to_numeric(labels_series, errors="coerce"))
-    labels_array = labels_numeric.to_numpy()
+    labels_array = labels_numeric.to_numpy(dtype=float)
     labels_zero_based = labels_array.astype(float)
+    labeled_mask = np.isfinite(labels_zero_based) & (labels_zero_based > 0)
+    if not np.any(labeled_mask):
+        raise ValueError("No labeled rows available after preprocessing.")
+
+    classes = sorted({int(value) for value in labels_zero_based[labeled_mask]})
+    num_classes = len(classes)
+    if num_classes < 2:
+        raise ValueError("DGCyTOF requires at least two classes to train.")
+
+    if not TORCH_AVAILABLE or not DGCYTOF_AVAILABLE:
+        reasons = []
+        if not TORCH_AVAILABLE and TORCH_IMPORT_ERROR is not None:
+            reasons.append(f"PyTorch unavailable ({TORCH_IMPORT_ERROR})")
+        if not DGCYTOF_AVAILABLE and DGCYTOF_IMPORT_ERROR is not None:
+            reasons.append(f"dgcytof_local unavailable ({DGCYTOF_IMPORT_ERROR})")
+        print(
+            "DGCyTOF: using sklearn MLP fallback because " + "; ".join(reasons),
+            file=sys.stderr,
+            flush=True,
+        )
+        classifier = MLPClassifier(
+            hidden_layer_sizes=(128, 64),
+            activation="relu",
+            solver="adam",
+            alpha=1e-4,
+            learning_rate_init=1e-3,
+            max_iter=100,
+            early_stopping=True,
+            validation_fraction=0.2,
+            random_state=random_state,
+        )
+        classifier.fit(train_data.loc[labeled_mask].to_numpy(), labels_zero_based[labeled_mask].astype(int))
+        return classifier, None
+
     df = train_data.copy()
     df["label"] = labels_zero_based
+
+    assert DGCyTOF is not None
+    assert torch is not None
+    assert nn is not None
+    assert TensorDataset is not None
+    torch_nn = cast(Any, nn)
 
     # Use only labeled rows for training, but keep the full matrix for inference.
     X_data_labeled, y_data, _ = DGCyTOF.preprocessing(df, [])
@@ -305,6 +336,21 @@ def train_dgcytof(train_data, train_labels, random_state=42):
         torch.tensor(y_val_arr),
     )
 
+    class SimpleClassifier(nn.Module):
+        def __init__(self, input_dim, num_classes):
+            super().__init__()
+            self.model = torch_nn.Sequential(
+                torch_nn.Linear(input_dim, 128),
+                torch_nn.ReLU(),
+                torch_nn.Dropout(0.1),
+                torch_nn.Linear(128, 64),
+                torch_nn.ReLU(),
+                torch_nn.Linear(64, num_classes),
+            )
+
+        def forward(self, x):  # pragma: no cover - passthrough
+            return self.model(x)
+
     model_fc = SimpleClassifier(
         input_dim=X_data_labeled.shape[1], num_classes=num_classes
     )
@@ -330,7 +376,15 @@ def train_dgcytof(train_data, train_labels, random_state=42):
     return model_fc, classes
 
 
-def predict_dgcytof(model, data: pd.DataFrame, classes: List[int]) -> np.ndarray:
+def predict_dgcytof(
+    model, data: pd.DataFrame, classes: Optional[List[int]]
+) -> np.ndarray:
+    if hasattr(model, "predict") and classes is None:
+        predicted = model.predict(data.to_numpy())
+        return np.asarray(predicted, dtype=int)
+
+    assert torch is not None
+    assert classes is not None
     model.eval()
     with torch.no_grad():
         full_tensor = torch.tensor(data.values, dtype=torch.float32)
