@@ -361,9 +361,9 @@ def main():
         required=True,
     )
     parser.add_argument(
-        "--data.label_key",
+        "--data.metadata",
         type=str,
-        help="label key metadata path (accepted but unused).",
+        help="metadata JSON.gz path (accepted but unused).",
         required=False,
     )
     parser.add_argument(
