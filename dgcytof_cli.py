@@ -25,6 +25,8 @@ import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.impute import SimpleImputer
 
 try:
     import torch
@@ -266,16 +268,19 @@ def train_dgcytof(train_data, train_labels, random_state=42):
             file=sys.stderr,
             flush=True,
         )
-        classifier = MLPClassifier(
-            hidden_layer_sizes=(128, 64),
-            activation="relu",
-            solver="adam",
-            alpha=1e-4,
-            learning_rate_init=1e-3,
-            max_iter=100,
-            early_stopping=True,
-            validation_fraction=0.2,
-            random_state=random_state,
+        classifier = make_pipeline(
+            SimpleImputer(strategy="median"),
+            MLPClassifier(
+                hidden_layer_sizes=(128, 64),
+                activation="relu",
+                solver="adam",
+                alpha=1e-4,
+                learning_rate_init=1e-3,
+                max_iter=100,
+                early_stopping=True,
+                validation_fraction=0.2,
+                random_state=random_state,
+            ),
         )
         classifier.fit(train_data.loc[labeled_mask].to_numpy(), labels_zero_based[labeled_mask].astype(int))
         return classifier, None
