@@ -24,9 +24,6 @@ from typing import Any, List, Optional, Tuple, cast
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import train_test_split
-from sklearn.neural_network import MLPClassifier
-from sklearn.pipeline import make_pipeline
-from sklearn.impute import SimpleImputer
 
 try:
     import torch
@@ -263,27 +260,9 @@ def train_dgcytof(train_data, train_labels, random_state=42):
             reasons.append(f"PyTorch unavailable ({TORCH_IMPORT_ERROR})")
         if not DGCYTOF_AVAILABLE and DGCYTOF_IMPORT_ERROR is not None:
             reasons.append(f"dgcytof_local unavailable ({DGCYTOF_IMPORT_ERROR})")
-        print(
-            "DGCyTOF: using sklearn MLP fallback because " + "; ".join(reasons),
-            file=sys.stderr,
-            flush=True,
+        raise RuntimeError(
+            "DGCyTOF dependencies are unavailable: " + "; ".join(reasons)
         )
-        classifier = make_pipeline(
-            SimpleImputer(strategy="median"),
-            MLPClassifier(
-                hidden_layer_sizes=(128, 64),
-                activation="relu",
-                solver="adam",
-                alpha=1e-4,
-                learning_rate_init=1e-3,
-                max_iter=100,
-                early_stopping=True,
-                validation_fraction=0.2,
-                random_state=random_state,
-            ),
-        )
-        classifier.fit(train_data.loc[labeled_mask].to_numpy(), labels_zero_based[labeled_mask].astype(int))
-        return classifier, None
 
     df = train_data.copy()
     df["label"] = labels_zero_based
@@ -435,6 +414,7 @@ def main():
         help="name of the dataset",
         default="clustbench",
     )
+    parser.add_argument("--seed", type=int, default=42)
 
     try:
         args = parser.parse_args()
@@ -443,6 +423,10 @@ def main():
         sys.exit(0)
 
     name = args.name
+    np.random.seed(args.seed)
+    if TORCH_AVAILABLE:
+        assert torch is not None
+        torch.manual_seed(args.seed)
     output_dir = args.output_dir or "."
     os.makedirs(output_dir, exist_ok=True)
 
@@ -455,7 +439,7 @@ def main():
     test_samples = load_test_samples(getattr(args, "data.test_matrix"))
 
     print("DGCyTOF: training model", flush=True)
-    model, classes = train_dgcytof(train_data, train_labels)
+    model, classes = train_dgcytof(train_data, train_labels, random_state=args.seed)
 
     output_path = os.path.join(output_dir, f"{name}_predicted_labels.tar.gz")
     if os.path.islink(output_path):
