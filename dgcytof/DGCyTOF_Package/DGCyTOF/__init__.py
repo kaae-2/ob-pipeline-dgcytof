@@ -84,8 +84,12 @@ def validate_model(model_fc, val_tensor, classes, params_val = {'batch_size':100
     print("Accuracy:", round(100 *val_correct.item() / val_total, 4))
     print('-'*100)
     for i in range(labels):
+        if class_total[i] == 0:
+            accuracy = "n/a"
+        else:
+            accuracy = round(100 * class_correct[i] / class_total[i], 3)
         print('Accuracy of {} : {}'.format (
-            classes[i], round(100 * class_correct[i] / class_total[i], 3)))
+            classes[i], accuracy))
         
     # Return. validation results
     return list(zip(val_predicted, val_labels, val_outputs))

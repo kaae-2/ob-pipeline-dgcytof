@@ -234,6 +234,17 @@ class DependencyContractTests(unittest.TestCase):
             self.assertEqual(pending.parent, destination.parent)
             self.assertEqual(destination, output)
 
+    def test_training_accepts_a_class_missing_from_validation(self):
+        train = pd.DataFrame({'marker': np.arange(10, dtype=float)})
+        labels = pd.Series([1] * 9 + [2])
+
+        _model, classes, validation_results = dgcytof_cli.train_dgcytof(
+            train, labels, random_state=42
+        )
+
+        self.assertEqual(classes, [1, 2])
+        self.assertEqual(len(validation_results), 2)
+
     def test_missing_pytorch_fails_instead_of_using_another_model(self):
         train = pd.DataFrame({'marker': [0.0, 1.0, 2.0, 3.0]})
         labels = pd.Series([1, 1, 2, 2])
