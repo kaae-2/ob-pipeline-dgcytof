@@ -139,35 +139,82 @@ class DependencyContractTests(unittest.TestCase):
         )
 
     def test_unresolved_rows_are_clustered_and_new_subtypes_map_to_zero(self):
-        model, data, validation_results = calibration_fixture()
-        data.iloc[7] = data.iloc[6]
+        data = pd.DataFrame(np.arange(40, dtype=float).reshape(10, 4))
+        calibration = {
+            'predictions': np.zeros(10, dtype=int),
+            'unresolved_positions': list(range(10)),
+            'unresolved_index': list(range(10)),
+            'threshold': 0.5,
+            'confident_count': 0,
+            'initial_uncertain_count': 10,
+            'promoted_count': 0,
+            'unresolved_count': 10,
+        }
         figure = plt.figure()
 
         with patch.object(
+            dgcytof_cli,
+            'calibrate_with_indices',
+            return_value=calibration,
+        ), patch.object(
             dgcytof_cli.DGCyTOF,
             'dimensionality_reduction_and_clustering',
             return_value=(
-                np.asarray([[0.0, 0.0]]),
-                np.asarray([3]),
+                np.zeros((10, 2)),
+                np.full(10, 3),
                 ['New Subtype 5'],
                 figure,
             ),
         ) as clustering:
             result = dgcytof_cli.classify_sample(
-                model,
+                object(),
                 data,
                 [1, 2],
-                validation_results,
+                [],
             )
 
         np.testing.assert_array_equal(
             clustering.call_args.args[0],
-            data.iloc[[6]].to_numpy(dtype=np.float32),
+            data.to_numpy(dtype=np.float32),
         )
-        self.assertEqual(result['predictions'].tolist()[-2:], [0, 2])
-        self.assertEqual(result['clustering']['cluster_counts'], {'3': 1})
-        self.assertEqual(result['rejection_count'], 1)
+        self.assertEqual(result['predictions'].tolist(), [0] * 10)
+        self.assertEqual(result['clustering']['cluster_counts'], {'3': 10})
+        self.assertEqual(result['rejection_count'], 10)
         self.assertNotIn(figure.number, plt.get_fignums())
+
+    def test_clustering_skips_an_undersized_unresolved_set(self):
+        calibration = {
+            'predictions': np.asarray([1, 0]),
+            'unresolved_positions': [1],
+            'unresolved_index': [1],
+            'threshold': 0.5,
+            'confident_count': 1,
+            'initial_uncertain_count': 1,
+            'promoted_count': 0,
+            'unresolved_count': 1,
+        }
+        with patch.object(
+            dgcytof_cli,
+            'calibrate_with_indices',
+            return_value=calibration,
+        ), patch.object(
+            dgcytof_cli.DGCyTOF,
+            'dimensionality_reduction_and_clustering',
+            return_value=(np.zeros((1, 2)), np.asarray([-1]), [], None),
+        ) as clustering:
+            result = dgcytof_cli.classify_sample(
+                object(), pd.DataFrame([[1.0], [2.0]]), [1, 2], []
+            )
+
+        clustering.assert_not_called()
+        self.assertFalse(result['clustering']['invoked'])
+        self.assertEqual(result['clustering']['input_count'], 1)
+        self.assertEqual(
+            result['clustering']['reason'],
+            'fewer than 10 unresolved cells; subtype clustering requires at least 10',
+        )
+        self.assertEqual(result['predictions'].tolist(), [1, 0])
+        self.assertEqual(result['rejection_count'], 1)
 
     def test_clustering_records_when_no_cells_remain_unresolved(self):
         calibration = {

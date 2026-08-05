@@ -234,7 +234,7 @@ def classify_sample(model, data, classes, validation_results):
         model, data, classes, validation_results
     )
     unresolved_positions = calibration['unresolved_positions']
-    if unresolved_positions:
+    if len(unresolved_positions) >= 10:
         unresolved_data = data.iloc[unresolved_positions].to_numpy(
             dtype=np.float32
         )
@@ -258,6 +258,17 @@ def classify_sample(model, data, classes, validation_results):
                 for label, count in sorted(cluster_counts.items())
             },
             'new_subtypes': list(new_subtypes),
+        }
+    elif unresolved_positions:
+        clustering = {
+            'invoked': False,
+            'input_count': len(unresolved_positions),
+            'cluster_counts': {},
+            'new_subtypes': [],
+            'reason': (
+                'fewer than 10 unresolved cells; subtype clustering requires '
+                'at least 10'
+            ),
         }
     else:
         clustering = {
