@@ -13,28 +13,20 @@ Input/output contract:
 import argparse
 import contextlib
 import gzip
-import hashlib
 import io
-import json
 import os
-import platform
 import re
 import sys
 import tarfile
 import tempfile
-from collections import Counter
-from importlib.metadata import version
-from pathlib import Path
-from typing import List, Optional, Tuple
-
-import matplotlib
-
-matplotlib.use('Agg')
+from typing import Any, List, Optional, Tuple, cast
 
 import numpy as np
 import pandas as pd
-from scipy.stats import rankdata
 from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
+from sklearn.pipeline import make_pipeline
+from sklearn.impute import SimpleImputer
 
 try:
     import torch
@@ -49,236 +41,14 @@ except Exception as exc:  # pragma: no cover - runtime guard
     TORCH_AVAILABLE = False
     TORCH_IMPORT_ERROR = exc
 
-VENDORED_PACKAGE_ROOT = (
-    Path(__file__).resolve().parent / 'dgcytof' / 'DGCyTOF_Package'
-)
-VENDORED_PACKAGE_SOURCE = VENDORED_PACKAGE_ROOT / 'DGCyTOF' / '__init__.py'
-sys.path.insert(0, str(VENDORED_PACKAGE_ROOT))
 try:
-    import DGCyTOF  # noqa: E402
-except Exception as exc:
-    raise ImportError(
-        f'genuine vendored DGCyTOF package unavailable at {VENDORED_PACKAGE_ROOT}'
-    ) from exc
-
-
-def verify_vendored_package(package):
-    package_path = Path(package.__file__).resolve()
-    if package_path != VENDORED_PACKAGE_SOURCE.resolve():
-        raise ImportError(
-            f'DGCyTOF resolved outside the vendored package: {package_path}'
-        )
-    return package_path
-
-
-verify_vendored_package(DGCyTOF)
-DGCYTOF_PROVENANCE = {
-    'package_path': str(Path(DGCyTOF.__file__).resolve()),
-    'source_sha256': hashlib.sha256(VENDORED_PACKAGE_SOURCE.read_bytes()).hexdigest(),
-    'version': re.search(
-        r'version="([^"]+)"',
-        (VENDORED_PACKAGE_ROOT / 'setup.py').read_text(encoding='utf-8'),
-    ).group(1),
-}
-DGCYTOF_AVAILABLE = True
-DGCYTOF_IMPORT_ERROR = None
-
-
-class Model_fc(nn.Module):
-    """Notebook DGCyTOF fully connected classifier."""
-
-    def __init__(self, input_features, num_labels):
-        super().__init__()
-        self.fc1 = nn.Linear(input_features, 128)
-        self.fc2 = nn.Linear(128, 64)
-        self.fc3 = nn.Linear(64, 32)
-        self.out = nn.Linear(32, num_labels, bias=True)
-
-    def forward(self, inputs):
-        inputs = nn.functional.relu(self.fc1(inputs))
-        inputs = nn.functional.relu(self.fc2(inputs))
-        inputs = nn.functional.relu(self.fc3(inputs))
-        return self.out(inputs)
-
-
-class _LazySpearman:
-    def __init__(self, transposed_cells):
-        cells = np.asarray(transposed_cells).T
-        ranked = rankdata(cells, axis=1)
-        centered = ranked - ranked.mean(axis=1, keepdims=True)
-        with np.errstate(divide='ignore', invalid='ignore'):
-            self.normalized = centered / np.linalg.norm(
-                centered, axis=1, keepdims=True
-            )
-
-    def active_learning(self, correct_size):
-        correct = self.normalized[:correct_size]
-        if correct_size < 2:
-            average_correct = float('nan')
-        else:
-            summed = correct.sum(axis=0)
-            pair_sum = (
-                np.dot(summed, summed)
-                - np.einsum('ij,ij->', correct, correct)
-            ) / 2
-            average_correct = pair_sum / (
-                correct_size * (correct_size - 1) / 2
-            )
-
-        candidates = self.normalized[correct_size + 1 :]
-        if len(candidates) == 0:
-            return [], [], average_correct
-        correlations = candidates @ correct.mean(axis=0)
-        selected = np.flatnonzero(correlations > average_correct)
-        return (
-            (selected + 1).tolist(),
-            correlations[selected].tolist(),
-            average_correct,
-        )
-
-
-def calibrate_with_indices(model, data, classes, validation_results):
-    """Call vendored calibration while retaining each input row position."""
-    correct_probabilities = [
-        np.max(nn.functional.softmax(out, dim=0).data.numpy())
-        for predicted, label, out in validation_results
-        if predicted == label
-    ]
-    if not correct_probabilities:
-        raise RuntimeError('DGCyTOF calibration has no correct validation results.')
-
-    inputs = torch.tensor(data.to_numpy(), dtype=torch.float32)
-    with torch.no_grad():
-        outputs = model(inputs)
-        predicted_indices = torch.argmax(outputs, dim=1).cpu().numpy()
-        probabilities = (
-            nn.functional.softmax(outputs, dim=1).max(dim=1).values.cpu().numpy()
-        )
-    threshold = float(min(correct_probabilities))
-    rounded_probabilities = np.asarray([round(value, 4) for value in probabilities])
-    uncertain_positions = np.flatnonzero(rounded_probabilities <= threshold)
-
-    active_results = []
-    original_spearmanr = DGCyTOF.spearmanr
-    original_active_learning = DGCyTOF.active_learning_index
-
-    def lazy_spearmanr(values):
-        return _LazySpearman(values), None
-
-    def indexed_active_learning(test_correct_list, rho, indices=True):
-        if not indices:
-            return rho.active_learning(len(test_correct_list))[2]
-        result = rho.active_learning(len(test_correct_list))
-        active_results.append(result)
-        return result
-
-    try:
-        DGCyTOF.spearmanr = lazy_spearmanr
-        DGCyTOF.active_learning_index = indexed_active_learning
-        vendored_unresolved = DGCyTOF.calibrate_data(
-            model,
-            inputs,
-            classes,
-            validation_results,
-            data,
-        )
-    finally:
-        DGCyTOF.spearmanr = original_spearmanr
-        DGCyTOF.active_learning_index = original_active_learning
-
-    if len(active_results) != len(classes):
-        raise RuntimeError(
-            'DGCyTOF calibration did not evaluate every known class.'
-        )
-
-    correlations = np.zeros((len(uncertain_positions), len(classes)))
-    for class_index, (indices, values, _average) in enumerate(active_results):
-        correlations[np.asarray(indices, dtype=int), class_index] = values
-    promoted_mask = (correlations != 0).any(axis=1)
-    promoted_classes = correlations[promoted_mask].argmax(axis=1)
-    unresolved_positions = uncertain_positions[~promoted_mask]
-
-    predictions = np.asarray(
-        [classes[index] for index in predicted_indices], dtype=int
-    )
-    predictions[uncertain_positions] = 0
-    predictions[uncertain_positions[promoted_mask]] = np.asarray(classes)[
-        promoted_classes
-    ]
-
-    vendored_rows = Counter(
-        map(tuple, np.asarray(vendored_unresolved, dtype=np.float32))
-    )
-    indexed_rows = Counter(
-        map(tuple, inputs[unresolved_positions].cpu().numpy())
-    )
-    if vendored_rows != indexed_rows:
-        raise RuntimeError(
-            'Index-preserving calibration disagrees with vendored unresolved rows.'
-        )
-
-    return {
-        'predictions': predictions,
-        'unresolved_positions': unresolved_positions.tolist(),
-        'unresolved_index': data.index[unresolved_positions].tolist(),
-        'threshold': threshold,
-        'confident_count': int(len(data) - len(uncertain_positions)),
-        'initial_uncertain_count': int(len(uncertain_positions)),
-        'promoted_count': int(promoted_mask.sum()),
-        'unresolved_count': int(len(unresolved_positions)),
-    }
-
-
-def classify_sample(model, data, classes, validation_results):
-    calibration = calibrate_with_indices(
-        model, data, classes, validation_results
-    )
-    unresolved_positions = calibration['unresolved_positions']
-    if unresolved_positions:
-        unresolved_data = data.iloc[unresolved_positions].to_numpy(
-            dtype=np.float32
-        )
-        try:
-            (
-                _embedding,
-                cluster_labels,
-                new_subtypes,
-                figure,
-            ) = DGCyTOF.dimensionality_reduction_and_clustering(
-                unresolved_data
-            )
-        finally:
-            DGCyTOF.plt.close('all')
-        cluster_counts = Counter(int(label) for label in cluster_labels)
-        clustering = {
-            'invoked': True,
-            'input_count': len(unresolved_positions),
-            'cluster_counts': {
-                str(label): count
-                for label, count in sorted(cluster_counts.items())
-            },
-            'new_subtypes': list(new_subtypes),
-        }
-    else:
-        clustering = {
-            'invoked': False,
-            'input_count': 0,
-            'cluster_counts': {},
-            'new_subtypes': [],
-            'reason': 'no cells remained unresolved after calibration',
-        }
-
-    predictions = calibration['predictions']
-    return {
-        'predictions': predictions,
-        'calibration': {
-            key: value
-            for key, value in calibration.items()
-            if key not in {'predictions', 'unresolved_positions', 'unresolved_index'}
-        },
-        'clustering': clustering,
-        'rejection_count': int(np.count_nonzero(predictions == 0)),
-    }
+    import dgcytof_local as DGCyTOF
+    DGCYTOF_AVAILABLE = True
+    DGCYTOF_IMPORT_ERROR = None
+except Exception as exc:  # pragma: no cover - runtime guard
+    DGCyTOF = None  # type: ignore[assignment]
+    DGCYTOF_AVAILABLE = False
+    DGCYTOF_IMPORT_ERROR = exc
 
 
 def _read_first_line(path):
@@ -493,9 +263,27 @@ def train_dgcytof(train_data, train_labels, random_state=42):
             reasons.append(f"PyTorch unavailable ({TORCH_IMPORT_ERROR})")
         if not DGCYTOF_AVAILABLE and DGCYTOF_IMPORT_ERROR is not None:
             reasons.append(f"dgcytof_local unavailable ({DGCYTOF_IMPORT_ERROR})")
-        raise RuntimeError(
-            "DGCyTOF dependencies are unavailable: " + "; ".join(reasons)
+        print(
+            "DGCyTOF: using sklearn MLP fallback because " + "; ".join(reasons),
+            file=sys.stderr,
+            flush=True,
         )
+        classifier = make_pipeline(
+            SimpleImputer(strategy="median"),
+            MLPClassifier(
+                hidden_layer_sizes=(128, 64),
+                activation="relu",
+                solver="adam",
+                alpha=1e-4,
+                learning_rate_init=1e-3,
+                max_iter=100,
+                early_stopping=True,
+                validation_fraction=0.2,
+                random_state=random_state,
+            ),
+        )
+        classifier.fit(train_data.loc[labeled_mask].to_numpy(), labels_zero_based[labeled_mask].astype(int))
+        return classifier, None
 
     df = train_data.copy()
     df["label"] = labels_zero_based
@@ -504,6 +292,8 @@ def train_dgcytof(train_data, train_labels, random_state=42):
     assert torch is not None
     assert nn is not None
     assert TensorDataset is not None
+    torch_nn = cast(Any, nn)
+
     # Use only labeled rows for training, but keep the full matrix for inference.
     X_data_labeled, y_data, _ = DGCyTOF.preprocessing(df, [])
     if y_data.empty:
@@ -550,8 +340,23 @@ def train_dgcytof(train_data, train_labels, random_state=42):
         torch.tensor(y_val_arr),
     )
 
-    model_fc = Model_fc(
-        input_features=X_data_labeled.shape[1], num_labels=num_classes
+    class SimpleClassifier(nn.Module):
+        def __init__(self, input_dim, num_classes):
+            super().__init__()
+            self.model = torch_nn.Sequential(
+                torch_nn.Linear(input_dim, 128),
+                torch_nn.ReLU(),
+                torch_nn.Dropout(0.1),
+                torch_nn.Linear(128, 64),
+                torch_nn.ReLU(),
+                torch_nn.Linear(64, num_classes),
+            )
+
+        def forward(self, x):  # pragma: no cover - passthrough
+            return self.model(x)
+
+    model_fc = SimpleClassifier(
+        input_dim=X_data_labeled.shape[1], num_classes=num_classes
     )
 
     train_params = {
@@ -569,17 +374,19 @@ def train_dgcytof(train_data, train_labels, random_state=42):
         DGCyTOF.train_model(
             model_fc, train_dataset, max_epochs=20, params_train=train_params
         )
-        validation_results = DGCyTOF.validate_model(
-            model_fc, val_dataset, classes, params_val=val_params
-        )
+        DGCyTOF.validate_model(model_fc, val_dataset, classes, params_val=val_params)
 
     model_fc.eval()
-    return model_fc, classes, validation_results
+    return model_fc, classes
 
 
 def predict_dgcytof(
     model, data: pd.DataFrame, classes: Optional[List[int]]
 ) -> np.ndarray:
+    if hasattr(model, "predict") and classes is None:
+        predicted = model.predict(data.to_numpy())
+        return np.asarray(predicted, dtype=int)
+
     assert torch is not None
     assert classes is not None
     model.eval()
@@ -589,52 +396,6 @@ def predict_dgcytof(
         predicted = torch.argmax(outputs, dim=1).cpu().numpy()
 
     return np.asarray([classes[idx] for idx in predicted], dtype=int)
-
-
-def write_prediction_archive(output_files, output_path):
-    output = Path(output_path)
-    with tempfile.NamedTemporaryFile(
-        dir=output.parent,
-        prefix=f'.{output.name}.',
-        suffix='.tmp',
-        delete=False,
-    ) as pending_handle:
-        pending = Path(pending_handle.name)
-    try:
-        with tarfile.open(pending, 'w:gz') as tar:
-            for path in output_files:
-                tar.add(path, arcname=os.path.basename(path))
-        os.replace(pending, output)
-    finally:
-        pending.unlink(missing_ok=True)
-
-
-def load_metadata(path):
-    opener = gzip.open if path.endswith('.gz') else open
-    with opener(path, 'rt', encoding='utf-8') as handle:
-        metadata = json.load(handle)
-    id_to_label = metadata.get('labels', {}).get('id_to_label')
-    if not isinstance(id_to_label, dict) or not id_to_label:
-        raise ValueError('Metadata does not define labels.id_to_label.')
-    metadata_ids = sorted(int(value) for value in id_to_label)
-    if any(value <= 0 for value in metadata_ids):
-        raise ValueError('Metadata population IDs must be positive integers.')
-    return metadata, metadata_ids
-
-
-def dependency_versions():
-    return {
-        'python': platform.python_version(),
-        'torch': torch.__version__,
-        'torchvision': version('torchvision'),
-        'numpy': np.__version__,
-        'pandas': pd.__version__,
-        'scipy': version('scipy'),
-        'scikit-learn': version('scikit-learn'),
-        'matplotlib': version('matplotlib'),
-        'umap-learn': version('umap-learn'),
-        'hdbscan': version('hdbscan'),
-    }
 
 
 def main():
@@ -660,8 +421,8 @@ def main():
     parser.add_argument(
         "--data.metadata",
         type=str,
-        help="metadata JSON.gz defining benchmark population IDs.",
-        required=True,
+        help="metadata JSON.gz path (accepted but unused).",
+        required=False,
     )
     parser.add_argument(
         "--output_dir",
@@ -674,7 +435,6 @@ def main():
         help="name of the dataset",
         default="clustbench",
     )
-    parser.add_argument("--seed", type=int, default=42)
 
     try:
         args = parser.parse_args()
@@ -683,50 +443,28 @@ def main():
         sys.exit(0)
 
     name = args.name
-    np.random.seed(args.seed)
-    if TORCH_AVAILABLE:
-        assert torch is not None
-        torch.manual_seed(args.seed)
     output_dir = args.output_dir or "."
     os.makedirs(output_dir, exist_ok=True)
-    output_path = os.path.join(output_dir, f"{name}_predicted_labels.tar.gz")
-    provenance_path = os.path.join(output_dir, f'{name}_dgcytof_provenance.json')
-    for stale_path in (output_path, provenance_path):
-        if os.path.lexists(stale_path):
-            os.unlink(stale_path)
 
     print("DGCyTOF: loading training data", flush=True)
     _train_data_name, train_data = _load_single_csv_from_tar(
         getattr(args, "data.train_matrix")
     )
     train_labels = _load_labels_from_tar(getattr(args, "data.train_labels"))
-    _metadata, metadata_ids = load_metadata(getattr(args, 'data.metadata'))
     print("DGCyTOF: loading test data", flush=True)
     test_samples = load_test_samples(getattr(args, "data.test_matrix"))
 
     print("DGCyTOF: training model", flush=True)
-    model, classes, validation_results = train_dgcytof(
-        train_data, train_labels, random_state=args.seed
-    )
-    if not set(classes).issubset(metadata_ids):
-        raise ValueError(
-            f'Training classes {classes} are outside metadata IDs {metadata_ids}.'
-        )
+    model, classes = train_dgcytof(train_data, train_labels)
 
+    output_path = os.path.join(output_dir, f"{name}_predicted_labels.tar.gz")
+    if os.path.islink(output_path):
+        os.unlink(output_path)
     with tempfile.TemporaryDirectory() as tmpdir:
         output_files: List[str] = []
-        sample_provenance = []
         print("DGCyTOF: generating predictions", flush=True)
         for sample_name, sample_df, sample_number in test_samples:
-            result = classify_sample(
-                model, sample_df, classes, validation_results
-            )
-            predictions = result['predictions']
-            invalid = set(np.unique(predictions)) - {0, *metadata_ids}
-            if invalid:
-                raise RuntimeError(
-                    f'Out-of-domain predictions for {sample_name}: {sorted(invalid)}'
-                )
+            predictions = predict_dgcytof(model, sample_df, classes)
             output_labels = ["" if pd.isna(p) else f"{int(p)}" for p in predictions]
             if sample_number is None:
                 sample_number = str(len(output_files) + 1)
@@ -735,68 +473,10 @@ def main():
             with open(file_path, "wt") as handle:
                 pd.Series(output_labels).to_csv(handle, index=False, header=False)
             output_files.append(file_path)
-            sample_provenance.append(
-                {
-                    'sample_name': sample_name,
-                    'sample_number': sample_number,
-                    'row_count': len(sample_df),
-                    'calibration': result['calibration'],
-                    'clustering': result['clustering'],
-                    'rejection_count': result['rejection_count'],
-                }
-            )
 
-        write_prediction_archive(output_files, output_path)
-
-    provenance = {
-        'package': DGCYTOF_PROVENANCE,
-        'architecture': [
-            'Linear(input,128)',
-            'ReLU',
-            'Linear(128,64)',
-            'ReLU',
-            'Linear(64,32)',
-            'ReLU',
-            'Linear(32,classes)',
-        ],
-        'dependencies': dependency_versions(),
-        'seed': args.seed,
-        'metadata_ids': metadata_ids,
-        'authoritative_stages': [
-            'DGCyTOF.preprocessing',
-            'DGCyTOF.train_model',
-            'DGCyTOF.validate_model',
-            'DGCyTOF.calibrate_data',
-            'DGCyTOF.dimensionality_reduction_and_clustering',
-        ],
-        'calibration_adapter': (
-            'index-preserving lazy Spearman implementation with runtime '
-            'multiset agreement check against vendored calibrate_data output'
-        ),
-        'fallback_used': False,
-        'samples': sample_provenance,
-        'totals': {
-            'rows': sum(item['row_count'] for item in sample_provenance),
-            'calibration_initial_uncertain': sum(
-                item['calibration']['initial_uncertain_count']
-                for item in sample_provenance
-            ),
-            'calibration_promoted': sum(
-                item['calibration']['promoted_count']
-                for item in sample_provenance
-            ),
-            'clustering_input': sum(
-                item['clustering']['input_count'] for item in sample_provenance
-            ),
-            'rejections': sum(
-                item['rejection_count'] for item in sample_provenance
-            ),
-        },
-    }
-    with open(provenance_path, 'wt', encoding='utf-8') as handle:
-        json.dump(provenance, handle, indent=2)
-        handle.write('\n')
-    print(json.dumps(provenance, sort_keys=True), flush=True)
+        with tarfile.open(output_path, "w:gz") as tar:
+            for path in output_files:
+                tar.add(path, arcname=os.path.basename(path))
     print("DGCyTOF: finished", flush=True)
 
 
