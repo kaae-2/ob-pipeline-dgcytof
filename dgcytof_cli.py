@@ -51,6 +51,9 @@ except Exception as exc:  # pragma: no cover - runtime guard
     DGCYTOF_IMPORT_ERROR = exc
 
 
+UNKNOWN_CONFIDENCE_THRESHOLD = 0.7
+
+
 def _read_first_line(path):
     """Read the first line of a (possibly gzipped) file."""
     opener = gzip.open if path.endswith(".gz") else open
@@ -248,6 +251,7 @@ def train_dgcytof(train_data, train_labels, random_state=42):
     labels_numeric = pd.Series(pd.to_numeric(labels_series, errors="coerce"))
     labels_array = labels_numeric.to_numpy(dtype=float)
     labels_zero_based = labels_array.astype(float)
+    labels_zero_based[labels_zero_based == 0] = np.nan
     labeled_mask = np.isfinite(labels_zero_based) & (labels_zero_based > 0)
     if not np.any(labeled_mask):
         raise ValueError("No labeled rows available after preprocessing.")
@@ -282,7 +286,10 @@ def train_dgcytof(train_data, train_labels, random_state=42):
                 random_state=random_state,
             ),
         )
-        classifier.fit(train_data.loc[labeled_mask].to_numpy(), labels_zero_based[labeled_mask].astype(int))
+        classifier.fit(
+            train_data.loc[labeled_mask].to_numpy(),
+            labels_zero_based[labeled_mask].astype(int),
+        )
         return classifier, None
 
     df = train_data.copy()
@@ -293,6 +300,7 @@ def train_dgcytof(train_data, train_labels, random_state=42):
     assert nn is not None
     assert TensorDataset is not None
     torch_nn = cast(Any, nn)
+    torch.manual_seed(random_state)
 
     # Use only labeled rows for training, but keep the full matrix for inference.
     X_data_labeled, y_data, _ = DGCyTOF.preprocessing(df, [])
@@ -381,10 +389,16 @@ def train_dgcytof(train_data, train_labels, random_state=42):
 
 
 def predict_dgcytof(
-    model, data: pd.DataFrame, classes: Optional[List[int]]
+    model,
+    data: pd.DataFrame,
+    classes: Optional[List[int]],
+    rejection_threshold: float = UNKNOWN_CONFIDENCE_THRESHOLD,
 ) -> np.ndarray:
+    """Predict known labels and map sub-threshold confidence to label 0."""
     if hasattr(model, "predict") and classes is None:
         predicted = model.predict(data.to_numpy())
+        probabilities = model.predict_proba(data.to_numpy())
+        predicted[np.max(probabilities, axis=1) < rejection_threshold] = 0
         return np.asarray(predicted, dtype=int)
 
     assert torch is not None
@@ -393,9 +407,13 @@ def predict_dgcytof(
     with torch.no_grad():
         full_tensor = torch.tensor(data.values, dtype=torch.float32)
         outputs = model(full_tensor)
-        predicted = torch.argmax(outputs, dim=1).cpu().numpy()
+        probabilities = torch.softmax(outputs, dim=1)
+        predicted = torch.argmax(probabilities, dim=1).cpu().numpy()
 
-    return np.asarray([classes[idx] for idx in predicted], dtype=int)
+    output = np.asarray([classes[idx] for idx in predicted], dtype=int)
+    confidence = torch.max(probabilities, dim=1).values.cpu().numpy()
+    output[confidence < rejection_threshold] = 0
+    return output
 
 
 def main():
@@ -456,6 +474,10 @@ def main():
 
     print("DGCyTOF: training model", flush=True)
     model, classes = train_dgcytof(train_data, train_labels)
+    print(
+        f"DGCyTOF: unknown confidence threshold={UNKNOWN_CONFIDENCE_THRESHOLD:.2f}",
+        flush=True,
+    )
 
     output_path = os.path.join(output_dir, f"{name}_predicted_labels.tar.gz")
     if os.path.islink(output_path):
@@ -464,7 +486,9 @@ def main():
         output_files: List[str] = []
         print("DGCyTOF: generating predictions", flush=True)
         for sample_name, sample_df, sample_number in test_samples:
-            predictions = predict_dgcytof(model, sample_df, classes)
+            predictions = predict_dgcytof(
+                model, sample_df, classes
+            )
             output_labels = ["" if pd.isna(p) else f"{int(p)}" for p in predictions]
             if sample_number is None:
                 sample_number = str(len(output_files) + 1)
